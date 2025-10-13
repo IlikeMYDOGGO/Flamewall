@@ -1,0 +1,499 @@
+-- FlamewallVisual.lua
+-- Single LocalScript: make everything look Flamewall / Geometry Dash (150 BPM)
+-- Drop this into StarterPlayerScripts (or run as a LocalScript) and execute.
+
+local BPM = 150
+local secondsPerBeat = 60 / BPM
+local AUDIO_FILENAME = "Flamewall.mp3"
+local GITHUB_BLOB = "https://github.com/IlikeMYDOGGO/Flamewall/blob/main/Camellia%20-%20Flamewall.mp3"
+local NAME_TAG_DECAL_ID = 117511259916805 -- as requested
+local PLAYER = game:GetService("Players").LocalPlayer
+local RS = game:GetService("RunService")
+local TS = game:GetService("TweenService")
+local Lighting = game:GetService("Lighting")
+local Debris = game:GetService("Debris")
+
+-- convert github blob -> raw URL
+local function githubRawUrl(blobUrl)
+    local raw = blobUrl:gsub("github.com", "raw.githubusercontent.com"):gsub("/blob/", "/")
+    return raw
+end
+local RAW_AUDIO_URL = githubRawUrl(GITHUB_BLOB)
+
+-- small utility logger
+local function log(...)
+    local s = ""
+    for i = 1, select("#", ...) do
+        s = s .. tostring(select(i, ...)) .. " "
+    end
+    pcall(function() print("[Flamewall] " .. s) end)
+end
+
+-- attempt to download and save audio using readfile/writefile (executor required)
+local function downloadAudio()
+    local filename = AUDIO_FILENAME
+    local ok, content = pcall(readfile, filename)
+    if ok and content then
+        log("Audio already present:", filename)
+        return true
+    end
+
+    log("Downloading audio from repo...")
+    local success, raw = pcall(function() return game:HttpGet(RAW_AUDIO_URL) end)
+    if not success or not raw or raw == "" then
+        log("Failed to download audio. Audio may not play (HTTP blocked).")
+        return false
+    end
+
+    -- try writing file
+    local wrote = pcall(writefile, filename, raw)
+    if not wrote then
+        log("Failed to write file to disk. Executor may not permit writefile.")
+        return false
+    end
+    log("Downloaded and saved", filename)
+    return true
+end
+
+-- create/ensure a private container in CoreGui for sounds and overlays
+local function ensureContainer()
+    local name = "Flamewall_ClientContainer"
+    local container = game.CoreGui:FindFirstChild(name)
+    if container then return container end
+    container = Instance.new("Folder")
+    container.Name = name
+    container.Parent = game.CoreGui
+    return container
+end
+
+-- create the main looping music sound
+local function setupMusic()
+    local container = ensureContainer()
+    -- remove previous sounds
+    for _, v in ipairs(container:GetDescendants()) do
+        if v:IsA("Sound") then v:Destroy() end
+    end
+
+    local music = Instance.new("Sound")
+    music.Name = "Flamewall_MainTrack"
+    music.Looped = true
+    music.Volume = 0.85
+    music.PlaybackSpeed = 1
+    -- try using getcustomasset (executor) to load local mp3, fallback to direct raw URL (may not play)
+    local ok = pcall(function()
+        music.SoundId = getcustomasset(AUDIO_FILENAME)
+    end)
+    if not ok then
+        -- fallback to direct http url (often blocked but included as fallback)
+        music.SoundId = RAW_AUDIO_URL
+    end
+    music.Parent = container
+    -- small delay to avoid audio errors
+    pcall(function() music:Play() end)
+    return music
+end
+
+-- Lighting / Sky / PostProcessing setup
+local function applyFlameLighting()
+    -- Set general lighting values
+    Lighting.Ambient = Color3.fromRGB(40, 10, 6)
+    Lighting.OutdoorAmbient = Color3.fromRGB(40, 6, 6)
+    Lighting.Brightness = 2
+    Lighting.ClockTime = 18.5
+
+    -- Color correction + bloom + blur + sunrays (create if not exist)
+    local cc = Lighting:FindFirstChild("Flame_CC") or Instance.new("ColorCorrectionEffect")
+    cc.Name = "Flame_CC"
+    cc.Parent = Lighting
+    cc.TintColor = Color3.fromRGB(255, 120, 60)
+    cc.Contrast = 0.1
+    cc.Saturation = -0.1
+    cc.Brightness = 0.05
+
+    local bloom = Lighting:FindFirstChild("Flame_Bloom") or Instance.new("BloomEffect")
+    bloom.Name = "Flame_Bloom"
+    bloom.Parent = Lighting
+    bloom.Intensity = 2.5
+    bloom.Size = 56
+    bloom.Threshold = 0.45
+
+    local blur = Lighting:FindFirstChild("Flame_Blur") or Instance.new("BlurEffect")
+    blur.Name = "Flame_Blur"
+    blur.Parent = Lighting
+    blur.Size = 0
+
+    local sr = Lighting:FindFirstChild("Flame_SunRays") or Instance.new("SunRaysEffect")
+    sr.Name = "Flame_SunRays"
+    sr.Parent = Lighting
+    sr.Intensity = 0.04
+    sr.Spread = 0.6
+
+    -- fake sky: dark red horizon with tint (Sky object optional)
+    local sky = Lighting:FindFirstChildOfClass("Sky")
+    if not sky then
+        sky = Instance.new("Sky")
+        sky.Name = "Flame_Sky"
+        sky.Parent = Lighting
+    else
+        sky.Name = "Flame_Sky"
+    end
+    -- Keep blank sky textures; rely on color shifts for the hellish look
+    sky.SkyboxBk = ""
+    sky.SkyboxDn = ""
+    sky.SkyboxFt = ""
+    sky.SkyboxLf = ""
+    sky.SkyboxRt = ""
+    sky.SkyboxUp = ""
+
+    -- subtle heart beat ambient color shift coroutine
+    spawn(function()
+        local pulseT = 0
+        while true do
+            local br = 1.6 + math.sin(pulseT) * 0.45
+            local intensity = 2.5 + (math.sin(pulseT) * 0.8)
+            pcall(function() Lighting.Brightness = br end)
+            pcall(function() bloom.Intensity = intensity end)
+            pulseT = pulseT + (math.pi * 2 * (BPM / 60) * (1/8)) -- small continuous breathing
+            task.wait(0.04)
+        end
+    end)
+end
+
+-- create central fullscreen overlay for beat flash (puts under GUI)
+local function flashBeat()
+    local container = ensureContainer()
+    local gui = container:FindFirstChild("FlameFlashGui") or Instance.new("ScreenGui")
+    gui.Name = "FlameFlashGui"
+    gui.IgnoreGuiInset = true
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Global
+    gui.Parent = container
+
+    local f = gui:FindFirstChild("Flash") or Instance.new("Frame")
+    f.Name = "Flash"
+    f.AnchorPoint = Vector2.new(0.5, 0.5)
+    f.Size = UDim2.new(1,0,1,0)
+    f.Position = UDim2.new(0.5,0,0.5,0)
+    f.BackgroundColor3 = Color3.fromRGB(255,60,0)
+    f.BackgroundTransparency = 1
+    f.BorderSizePixel = 0
+    f.Parent = gui
+
+    -- return a function to pulse flash on beat
+    return function()
+        local tweenIn = TS:Create(f, TweenInfo.new(0.04, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {BackgroundTransparency = 0.25})
+        local tweenOut = TS:Create(f, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {BackgroundTransparency = 1})
+        tweenIn:Play()
+        tweenIn.Completed:Wait()
+        tweenOut:Play()
+    end
+end
+
+-- camera shake for beat (small)
+local function beatCameraShake()
+    local cam = workspace.CurrentCamera
+    if not cam then return end
+    local orig = cam.CFrame
+    local shakeAmt = 0.4
+    local jitter = CFrame.new((math.random()-0.5)*shakeAmt, (math.random()-0.5)*shakeAmt, (math.random()-0.5)*shakeAmt)
+    cam.CFrame = orig * jitter
+    task.delay(0.06, function()
+        if cam then
+            pcall(function() cam.CFrame = orig end)
+        end
+    end)
+end
+
+-- attach embers/flame emitters to player character for constant realistic embers
+local function attachEmbers(character)
+    if not character or not character:IsA("Model") then return end
+    local torso = character:FindFirstChild("HumanoidRootPart") or character:FindFirstChild("Torso") or character:FindFirstChild("UpperTorso")
+    if not torso then return end
+
+    -- helper to create a particle source part attached to torso
+    local part = Instance.new("Part")
+    part.Name = "FlamewallEmitterPart"
+    part.Size = Vector3.new(0.2, 0.2, 0.2)
+    part.Transparency = 1
+    part.CanCollide = false
+    part.Anchored = false
+    part.Massless = true
+    part.Parent = workspace
+    part.CFrame = torso.CFrame * CFrame.new(0, 1.2, 0)
+
+    local weld = Instance.new("WeldConstraint")
+    weld.Part0 = part
+    weld.Part1 = torso
+    weld.Parent = part
+
+    local ps = Instance.new("ParticleEmitter")
+    ps.Name = "FlamewallEmberParticles"
+    ps.Parent = part
+    ps.Speed = NumberRange.new(1.4, 3.4)
+    ps.Rate = 40
+    ps.Lifetime = NumberRange.new(0.6, 1.4)
+    ps.Rotation = NumberRange.new(0, 360)
+    ps.RotSpeed = NumberRange.new(-180,180)
+    ps.VelocitySpread = 90
+    ps.Size = NumberSequence.new{ NumberSequenceKeypoint.new(0, 0.4), NumberSequenceKeypoint.new(1, 0) }
+    ps.LightEmission = 0.8
+    ps.Transparency = NumberSequence.new{ NumberSequenceKeypoint.new(0, 0.15), NumberSequenceKeypoint.new(1, 1) }
+    ps.Color = ColorSequence.new{
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(255,160,60)),
+        ColorSequenceKeypoint.new(0.65, Color3.fromRGB(200,40,10)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(40,12,6)),
+    }
+
+    -- short-lived sparks part (low-rate)
+    local p2 = part:Clone()
+    p2.Name = "FlamewallSparkPart"
+    p2.Parent = workspace
+    local weld2 = Instance.new("WeldConstraint", p2)
+    weld2.Part0 = p2
+    weld2.Part1 = torso
+    local ps2 = Instance.new("ParticleEmitter", p2)
+    ps2.Rate = 6
+    ps2.Lifetime = NumberRange.new(0.6, 1.2)
+    ps2.Speed = NumberRange.new(2, 6)
+    ps2.Size = NumberSequence.new(0.08)
+    ps2.LightEmission = 1
+    ps2.Color = ColorSequence.new(Color3.fromRGB(255, 120, 60))
+    ps2.Transparency = NumberSequence.new(0.1)
+
+    -- cleanup on character removal
+    local function cleanup()
+        pcall(function()
+            ps.Enabled = false
+            ps2.Enabled = false
+            part:Destroy()
+            p2:Destroy()
+        end)
+    end
+    character.AncestryChanged:Connect(function(_, parent)
+        if not parent then cleanup() end
+    end)
+    PLAYER.CharacterRemoving:Connect(cleanup)
+end
+
+-- create a flame-themed billboard nametag above player's head using requested decal
+local function createNametag(character)
+    if not character then return end
+    local head = character:FindFirstChild("Head") or character:FindFirstChild("UpperTorso")
+    if not head then return end
+
+    -- remove old
+    local existing = head:FindFirstChild("FlamewallNametag")
+    if existing then existing:Destroy() end
+
+    local billboard = Instance.new("BillboardGui")
+    billboard.Name = "FlamewallNametag"
+    billboard.Adornee = head
+    billboard.Size = UDim2.new(0, 160, 0, 48)
+    billboard.StudsOffset = Vector3.new(0, 2.6, 0)
+    billboard.AlwaysOnTop = true
+    billboard.Parent = head
+
+    local img = Instance.new("ImageLabel")
+    img.Size = UDim2.new(0, 40, 0, 40)
+    img.Position = UDim2.new(0, 6, 0, 4)
+    img.BackgroundTransparency = 1
+    img.Parent = billboard
+    img.Image = "rbxassetid://" .. tostring(NAME_TAG_DECAL_ID)
+    img.ScaleType = Enum.ScaleType.Fit
+    img.Rotation = -6
+
+    local txt = Instance.new("TextLabel")
+    txt.Parent = billboard
+    txt.BackgroundTransparency = 1
+    txt.Position = UDim2.new(0, 52, 0, 2)
+    txt.Size = UDim2.new(0, 100, 0, 44)
+    txt.Font = Enum.Font.Arcade
+    txt.TextSize = 18
+    txt.Text = "FLAMEWALL"
+    txt.TextColor3 = Color3.new(1, 0.85, 0.6)
+    txt.TextStrokeColor3 = Color3.fromRGB(40, 6, 6)
+    txt.TextStrokeTransparency = 0
+    txt.TextXAlignment = Enum.TextXAlignment.Left
+
+    -- pulse the nametag on beat
+    spawn(function()
+        while billboard and billboard.Parent do
+            -- scale tween
+            local t1 = TS:Create(billboard, TweenInfo.new(0.06, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), {StudsOffset = Vector3.new(0, 2.9, 0)})
+            local t2 = TS:Create(billboard, TweenInfo.new(0.14, Enum.EasingStyle.Sine, Enum.EasingDirection.In), {StudsOffset = Vector3.new(0, 2.6, 0)})
+            t1:Play()
+            t1.Completed:Wait()
+            t2:Play()
+            task.wait(secondsPerBeat)
+        end
+    end)
+end
+
+-- attempt to reskin any GUI TextLabels/TextButtons to Flamewall theme and rename "ult" moves
+local function reskinPlayerGui()
+    local pg = PLAYER:WaitForChild("PlayerGui", 5)
+    if not pg then return end
+
+    local function styleTextObject(obj)
+        if not obj:IsA("TextLabel") and not obj:IsA("TextButton") and not obj:IsA("TextBox") then return end
+        pcall(function()
+            obj.TextColor3 = Color3.fromRGB(255, 200, 140)
+            obj.TextStrokeColor3 = Color3.fromRGB(48, 6, 6)
+            obj.TextStrokeTransparency = 0
+            obj.Font = Enum.Font.Arcade
+            obj.TextSize = math.max(14, (obj.TextSize or 18))
+            -- add subtle UICorner if none
+            if not obj:FindFirstChild("__Flame_UiStroke") then
+                local stroke = Instance.new("UIStroke")
+                stroke.Name = "__Flame_UiStroke"
+                stroke.Parent = obj
+                stroke.Color = Color3.fromRGB(255, 100, 40)
+                stroke.Thickness = 1.6
+                stroke.Transparency = 0.4
+            end
+        end)
+    end
+
+    local function renameUlts()
+        local ultIndex = 1
+        for _, v in ipairs(pg:GetDescendants()) do
+            if v:IsA("TextLabel") or v:IsA("TextButton") then
+                local t = v.Text:lower()
+                if string.find(t, "ult") or string.find(t, "ultimate") then
+                    v.Text = "ult move " .. tostring(ultIndex)
+                    ultIndex = ultIndex + 1
+                end
+                -- also change move visuals text that look like ability names
+                if #v.Text > 0 and #v.Text < 24 then
+                    v.Text = string.upper(v.Text)
+                end
+            end
+            -- apply styling to any text object
+            if v:IsA("TextLabel") or v:IsA("TextButton") or v:IsA("TextBox") then
+                styleTextObject(v)
+            end
+        end
+    end
+
+    -- initial pass + connect to future GUIs
+    renameUlts()
+    pg.DescendantAdded:Connect(function(d)
+        task.defer(function()
+            if d:IsA("TextLabel") or d:IsA("TextButton") or d:IsA("TextBox") then
+                styleTextObject(d)
+                task.wait(0.06)
+                renameUlts()
+            end
+        end)
+    end)
+end
+
+-- beat manager: pulses flash, camera shake, bloom, and optional extra effects
+local function startBeatLoop(music)
+    local pulseFlash = flashBeat()
+    local bloom = Lighting:FindFirstChild("Flame_Bloom")
+    local origBloom = bloom and bloom.Intensity or 2.5
+
+    spawn(function()
+        -- if music exists and is playing, sync to it roughly; else use local beat timing
+        while true do
+            local startTime = tick()
+            -- flash + camera shake + bloom pulse
+            pcall(function() pulseFlash() end)
+            pcall(function() beatCameraShake() end)
+            if bloom then
+                local tUp = TS:Create(bloom, TweenInfo.new(0.05, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Intensity = origBloom + 2.1})
+                local tDown = TS:Create(bloom, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {Intensity = origBloom})
+                tUp:Play(); tUp.Completed:Wait(); tDown:Play()
+            end
+
+            -- also pulse other client visuals (small)
+            pcall(function()
+                if PLAYER.Character then
+                    local hum = PLAYER.Character:FindFirstChildOfClass("Humanoid")
+                    if hum then
+                        -- tiny overscale of head or glow, harmless attempt
+                        local head = PLAYER.Character:FindFirstChild("Head")
+                        if head then
+                            -- temporarily create a subtle glow part
+                            local g = Instance.new("PointLight")
+                            g.Color = Color3.fromRGB(255, 120, 60)
+                            g.Range = 6
+                            g.Brightness = 1.2
+                            g.Parent = head
+                            Debris:AddItem(g, 0.12)
+                        end
+                    end
+                end
+            end)
+
+            -- wait until next beat, attempt to sync to music if possible
+            if music and music.IsPlaying then
+                -- try to use music.TimePosition to schedule next beat; fallback to secondsPerBeat
+                local ok, timepos = pcall(function() return music.TimePosition end)
+                if ok and timepos then
+                    -- nothing fancy: just step by secondsPerBeat
+                    task.wait(secondsPerBeat)
+                else
+                    task.wait(secondsPerBeat)
+                end
+            else
+                task.wait(secondsPerBeat)
+            end
+        end
+    end)
+end
+
+-- initialize everything (runs immediately)
+spawn(function()
+    -- download audio first (best effort)
+    local success = pcall(downloadAudio)
+    if not success then log("Audio download step encountered an error, continuing visuals only.") end
+
+    -- apply lighting & sky
+    pcall(applyFlameLighting)
+
+    -- setup music
+    local music = nil
+    local ok = pcall(function() music = setupMusic() end)
+    if not ok or not music then
+        log("Music failed to initialize. Visuals will still run.")
+    else
+        -- try playing (if not already)
+        pcall(function()
+            if not music.IsPlaying then music:Play() end
+            music.Volume = 0.85
+        end)
+    end
+
+    -- reskin PlayerGui + rename ults
+    pcall(reskinPlayerGui)
+
+    -- set up beat-synced UI & camera effects
+    pcall(function() startBeatLoop(music) end)
+
+    -- when player respawns: reattach emitters and nametag
+    local function onCharacterAdded(char)
+        task.wait(0.3)
+        pcall(function() attachEmbers(char) end)
+        pcall(function() createNametag(char) end)
+    end
+
+    if PLAYER.Character then
+        onCharacterAdded(PLAYER.Character)
+    end
+    PLAYER.CharacterAdded:Connect(onCharacterAdded)
+
+    -- finally, aggressively force client sky/color overrides and remove world lights that conflict
+    pcall(function()
+        for _, l in ipairs(workspace:GetDescendants()) do
+            if l:IsA("PointLight") or l:IsA("SurfaceLight") or l:IsA("SpotLight") then
+                -- don't remove lights on the character itself — only environmental lights
+                if not (l.Parent and l.Parent:IsDescendantOf(PLAYER.Character or {})) then
+                    pcall(function() l.Enabled = false end)
+                end
+            end
+        end
+    end)
+
+    log("Flamewall visuals initialized. Enjoy the heat.")
+end)
